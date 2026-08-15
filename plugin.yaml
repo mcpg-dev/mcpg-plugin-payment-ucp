@@ -1,0 +1,14 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.payment.ucp
+name: Universal Commerce Protocol (UCP)
+license: BUSL-1.1
+description: |
+  Universal Commerce Protocol implementation. Provides a unified
+  payment-required decision for arbitrary tools with per-tool
+  currency and pricing configuration.
+class: tool_gate
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  # Merchant discovery + checkout endpoints.
+  - network_outbound
