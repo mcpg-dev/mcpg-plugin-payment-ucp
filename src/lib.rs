@@ -41,16 +41,30 @@ use tracing::{info, warn};
 const PLUGIN_ID: &str = "dev.mcpg.payment.ucp";
 
 /// Stable ownership key for a checkout session. An authenticated caller
-/// is keyed by subject (+issuer); an anonymous caller falls back to its
-/// MCP session id so a different connection cannot address its session.
-/// Used to prevent cross-principal checkout IDOR.
+/// is keyed by subject (+issuer). An anonymous caller is keyed by its
+/// gateway session id (else the request id): over stdio that is the
+/// process session. Used to prevent cross-principal checkout IDOR.
 fn checkout_owner_key(ctx: &PluginContext) -> String {
     match ctx.identity.subject_id.as_deref() {
         Some(s) if !s.is_empty() => {
             format!("sub:{}|{}", s, ctx.identity.issuer.as_deref().unwrap_or(""))
         }
-        _ => format!("sess:{}", ctx.session_id.as_deref().unwrap_or("anon")),
+        _ => format!(
+            "sess:{}",
+            ctx.session_id.as_deref().unwrap_or(&ctx.request_id)
+        ),
     }
+}
+
+/// Whether the caller keeps an identity from one request to the next, so a
+/// checkout it opens can be completed: an authenticated caller, or the
+/// stdio process.
+fn holds_checkouts(ctx: &PluginContext) -> bool {
+    ctx.identity
+        .subject_id
+        .as_deref()
+        .is_some_and(|subject| !subject.is_empty())
+        || ctx.transport == "stdio"
 }
 
 use crate::checkout::{SessionTransport, UcpCheckoutSession};
@@ -608,6 +622,19 @@ impl UcpCommercePlugin {
             None => return GateDecision::allow(),
         };
 
+        // A checkout spans requests: the retry sends back the merchant
+        // session the 402 names. An anonymous HTTP caller has a new session
+        // on every request, so no retry of its own can reach the checkout;
+        // it is refused before the merchant is called.
+        if !holds_checkouts(ctx) {
+            return GateDecision::Deny {
+                http_status: 401,
+                code: UCP_CHECKOUT_REQUIRED_CODE,
+                message: "UCP checkout requires an authenticated caller".to_owned(),
+                error_data: None,
+            };
+        }
+
         // Resolve the (optional) merchant bearer token up front. A token
         // resolution failure fails closed rather than calling the merchant
         // unauthenticated.
@@ -648,6 +675,9 @@ impl UcpCommercePlugin {
                         session.owner = checkout_owner_key(ctx);
                         let challenge_data = session.build_challenge_data();
                         let session_id = session.session_id.clone();
+                        // Abandoned checkouts go once they expire.
+                        let ttl = self.session_ttl;
+                        self.sessions.retain(|_, held| !held.is_expired(ttl));
                         self.sessions.insert(session_id, session);
 
                         GateDecision::Challenge {
@@ -964,7 +994,7 @@ mod tests {
             "ucp/checkout_session": "nonexistent_session"
         });
         let decision = plugin.evaluate_pre(
-            &test_ctx("buy_product"),
+            &test_ctx_with_subject("buy_product", "alice"),
             &serde_json::json!({}),
             Some(&meta),
             &serde_json::json!({}),
@@ -985,6 +1015,58 @@ mod tests {
         ctx.identity.trust_level = "verified".into();
         ctx.identity.subject_id = Some(subject.into());
         ctx
+    }
+
+    /// An anonymous HTTP caller has a new session on every request, so a
+    /// checkout it opened could never be completed: it is refused before
+    /// the merchant is called. An authenticated caller and the stdio
+    /// process hold their checkouts.
+    #[test]
+    fn an_anonymous_http_caller_opens_no_checkout() {
+        let config = UcpProtocolConfig {
+            platform_profile_url: "".into(),
+            session_ttl_ms: 3600,
+            discovery_cache_ttl_ms: 3600,
+            default_transport: "rest".into(),
+            http_timeout_ms: 5,
+        };
+        let plugin = UcpCommercePlugin::from_config(&config, test_tool_configs()).unwrap();
+        match plugin.evaluate_pre(
+            &test_ctx("buy_product"),
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!({}),
+        ) {
+            GateDecision::Deny {
+                http_status, code, ..
+            } => {
+                assert_eq!(http_status, 401);
+                assert_eq!(code, UCP_CHECKOUT_REQUIRED_CODE);
+            }
+            other => panic!("expected a 401 refusal, got: {other:?}"),
+        }
+        assert!(plugin.sessions.is_empty(), "no checkout is kept");
+
+        assert!(!holds_checkouts(&test_ctx("buy_product")));
+        let mut stdio = test_ctx("buy_product");
+        stdio.transport = "stdio".into();
+        assert!(holds_checkouts(&stdio));
+        assert!(holds_checkouts(&test_ctx_with_subject(
+            "buy_product",
+            "alice"
+        )));
+    }
+
+    #[test]
+    fn no_two_anonymous_requests_share_a_checkout_owner_key() {
+        let mut first = test_ctx("buy_thing");
+        let mut second = test_ctx("buy_thing");
+        second.request_id = "req-2".into();
+        assert_ne!(checkout_owner_key(&first), checkout_owner_key(&second));
+
+        first.session_id = Some("ephemeral-1".into());
+        second.session_id = Some("ephemeral-2".into());
+        assert_ne!(checkout_owner_key(&first), checkout_owner_key(&second));
     }
 
     /// Regression: a checkout session created by one principal
